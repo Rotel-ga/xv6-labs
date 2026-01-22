@@ -6,6 +6,7 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "sysinfo.h"
 
 uint64
 sys_exit(void)
@@ -106,5 +107,24 @@ sys_trace(void)
     return -1;
   
   myproc()->trace_mask = mask;
+  return 0;
+}
+
+//收集系统信息
+uint64
+sys_sysinfo(void) 
+{
+  struct sysinfo info;
+  freebytes(&info.freemem);  //获取空闲内存量
+  procnum(&info.nproc);  //获取进程数
+
+  //获取用户虚拟地址
+  uint64 dstaddr;
+  argaddr(0, &dstaddr);
+
+  //将内核空间数据拷贝到用户空间
+  if(copyout(myproc()->pagetable, dstaddr, (char *)&info, sizeof info) < 0)
+    return -1;
+
   return 0;
 }
