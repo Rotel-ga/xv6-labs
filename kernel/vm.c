@@ -151,7 +151,10 @@ proc_kpt_init(){
   uvmmap(kernelpt, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
 
   // 映射CLINT（核心本地中断控制器）
-  uvmmap(kernelpt, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  // uvmmap(kernelpt, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  // CLINT 仅在内核启动的时候需要使用到，
+  // 而用户进程在内核态中的操作并不需要使用到该映射,
+  // 并且该映射会与要 map 的程序内存冲突 
 
   // 映射PLIC（平台级中断控制器）
   uvmmap(kernelpt, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
@@ -426,23 +429,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -452,40 +439,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
-
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+  return copyinstr_new(pagetable, dst, srcva, max);
 }
 
 /**
@@ -519,4 +473,48 @@ void
 vmprint(pagetable_t pagetable){
   printf("page table %p\n", pagetable);
   _vmprint(pagetable, 1);
+}
+
+// 将src页表的一部分页映射关系拷贝到dst页表，只拷贝页表项，不拷贝实际的物理内存
+int
+kvmcopymappings(pagetable_t src, pagetable_t dst, uint64 start, uint64 sz){
+  pte_t *pte;
+  uint64 pa, i;
+  uint64 flags;
+
+  for(i = PGROUNDUP(start); i < start + sz; i += PGSIZE){
+    if((pte = walk(src, i, 0)) == 0)
+      panic("kvmcopymappings: pte should exit");
+    if((*pte & PTE_V) == 0)
+      panic("kvmcopymappings: page not present");
+    pa = PTE2PA(*pte);
+
+    // `& ~PTE_U` 表示将该页的权限设置为非用户页
+    // 必须设置该权限，因为RISC-V 中内核是无法直接访问用户页的
+    flags = PTE_FLAGS(*pte) & ~PTE_U;
+    if(mappages(dst, i, PGSIZE, pa, flags) != 0)
+      goto err;
+  }
+
+  return 0;
+
+err:
+  //接触目标页表中已映射的页表项
+  uvmunmap(dst, PGROUNDUP(start), (i - PGROUNDUP(start)) / PGSIZE, 0);
+  return -1;
+}
+
+// 缩减内存的函数，用于同步内核页表和用户页表内存映射
+// 当用户页表缩减时，保证内核页表同步
+uint64
+kvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz){
+  if(newsz >= oldsz)
+    return oldsz;
+
+  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)) {
+    int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 0);
+  }
+
+  return newsz;
 }
