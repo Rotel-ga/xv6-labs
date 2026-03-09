@@ -23,33 +23,43 @@
 #include "fs.h"
 #include "buf.h"
 
-struct {
-  struct spinlock lock;
-  struct buf buf[NBUF];
+//哈希表中的桶号索引，设置质数个桶可降低哈希冲突的可能性
+#define NBUFMAP_BUCKET 13
+//哈希索引
+#define BUFMAP_HASH(dev, blockno) ((((dev)<<27)|(blockno))%NBUFMAP_BUCKET)
 
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
+struct {
+  //struct spinlock lock;
+  struct buf buf[NBUF];
+  struct spinlock eviction_lock;      //驱逐锁
+  //哈希表
+  struct buf bufmap[NBUFMAP_BUCKET];
+  struct spinlock bufmap_locks[NBUFMAP_BUCKET];  //桶锁
 } bcache;
 
 void
 binit(void)
 {
-  struct buf *b;
-
-  initlock(&bcache.lock, "bcache");
-
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+  //初始化桶锁
+  for(int i = 0; i < NBUFMAP_BUCKET; ++i){
+    initlock(&bcache.bufmap_locks[i], "bcache_bufmap");
+    bcache.bufmap[i].next = 0;
   }
+
+  for(int i = 0; i < NBUF; ++i){
+    // 初始化缓存区块
+    struct buf *b = &bcache.buf[i];
+    initsleeplock(&b->lock, "buffer");
+    b->lastuse = 0;
+    b->refcnt = 0;
+
+    //将所有缓存区块添加到bufmap[0]
+    b->next = bcache.bufmap[0].next;
+    bcache.bufmap[0].next = b;
+  }
+
+  initlock(&bcache.eviction_lock, "bcache_eviction");
+
 }
 
 // Look through buffer cache for block on device dev.
@@ -60,32 +70,94 @@ bget(uint dev, uint blockno)
 {
   struct buf *b;
 
-  acquire(&bcache.lock);
+  //哈希获取桶号
+  uint key = BUFMAP_HASH(dev, blockno);
 
-  // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
+  acquire(&bcache.bufmap_locks[key]);
+
+  //blockno的缓存区块是否已经在缓存区
+  for(b = bcache.bufmap[key].next;b;b = b->next){
     if(b->dev == dev && b->blockno == blockno){
       b->refcnt++;
-      release(&bcache.lock);
+      release(&bcache.bufmap_locks[key]);
       acquiresleep(&b->lock);
       return b;
     }
   }
 
-  // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
+  //不在缓存区
+
+  //为防止死锁，先释放当前桶锁
+  release(&bcache.bufmap_locks[key]);
+  //为防止blockno的缓存区被重复创建，加上驱逐锁
+  acquire(&bcache.eviction_lock);
+
+  //释放桶锁，加驱逐锁的间隙可能创建了blockno的缓存区块，所以再检查一次
+  for(b = bcache.bufmap[key].next;b;b = b->next){
+    if(b->dev == dev && b->blockno == blockno){
+      acquire(&bcache.bufmap_locks[key]); //添加引用次数时必须加上桶锁
+      b->refcnt++;
+      release(&bcache.bufmap_locks[key]);
+      release(&bcache.eviction_lock);
       acquiresleep(&b->lock);
       return b;
     }
   }
-  panic("bget: no buffers");
+
+  //仍不在缓存区
+  //此时只持有驱逐锁，不持有任何桶锁。查询所有桶中的LRU_buf
+  struct buf* before_least = 0;     // LRU_buf的前一个块
+  uint holding_bucket = -1;         // 记录当前持有哪个桶锁
+
+  //遍历所有桶
+  for(int i = 0;i < NBUFMAP_BUCKET; ++i){
+    acquire(&bcache.bufmap_locks[i]);      //获取当前遍历的桶锁
+    
+    int newfound = 0;        //是否在当前桶找到新的LRU_buf
+
+    for(b = &bcache.bufmap[i];b->next;b = b->next){
+      if(b->next->refcnt == 0 && (!before_least || b->next->lastuse < before_least->next->lastuse)) {
+        before_least = b;
+        newfound = 1;
+      }
+    }
+    if(!newfound)       //如果没找到新的LRU_buf，释放当前桶锁
+      release(&bcache.bufmap_locks[i]);
+    else{               //如果找到新的LRU_buf
+      if(holding_bucket != -1)       //如果找到的不是第一个LRU_buf，之前必持有某个桶锁，需释放
+        release(&bcache.bufmap_locks[holding_bucket]);   
+      holding_bucket = i;           //把标记holding_bucket更改成当前桶锁编号
+    }
+  }
+
+  //如果没有找到任何一个LRU_buf，表示没有空闲缓存块
+  if(!before_least)
+    panic("bget:no buffuers");
+  
+  b = before_least->next;     //b=LRU_buf
+
+  if(holding_bucket != key){     //想要偷的块不在key桶，就要把块从他所在的桶里驱逐
+    before_least->next = b->next;
+    release(&bcache.bufmap_locks[holding_bucket]);
+
+    //将LRU_buf添加到key桶
+    acquire(&bcache.bufmap_locks[key]);
+    b->next = bcache.bufmap[key].next;
+    bcache.bufmap[key].next = b;
+  }
+
+  //设置新buf字段
+  b->dev = dev;
+  b->blockno = blockno;
+  b->refcnt = 1;
+  b->valid = 0;
+  //释放相关锁
+  release(&bcache.bufmap_locks[key]);
+  release(&bcache.eviction_lock);
+  acquiresleep(&b->lock);
+  return b;
+
+
 }
 
 // Return a locked buf with the contents of the indicated block.
@@ -121,33 +193,33 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  uint key = BUFMAP_HASH(b->dev, b->blockno);
+
+  acquire(&bcache.bufmap_locks[key]);
   b->refcnt--;
   if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    b->lastuse = ticks;
   }
   
-  release(&bcache.lock);
+  release(&bcache.bufmap_locks[key]);
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  uint key = BUFMAP_HASH(b->dev, b->blockno);
+
+  acquire(&bcache.bufmap_locks[key]);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bcache.bufmap_locks[key]);
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  uint key = BUFMAP_HASH(b->dev, b->blockno);
+
+  acquire(&bcache.bufmap_locks[key]);
   b->refcnt--;
-  release(&bcache.lock);
+  release(&bcache.bufmap_locks[key]);
 }
 
 
