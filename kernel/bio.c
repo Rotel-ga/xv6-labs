@@ -62,6 +62,8 @@ binit(void)
 }
 
 // Look through buffer cache for block on device dev.
+// If not found, allocate a buffer.
+// In either case, return locked buffer.
 static struct buf*
 bget(uint dev, uint blockno)
 {
@@ -156,6 +158,31 @@ bget(uint dev, uint blockno)
   return b;
 }
 
+// Return a locked buf with the contents of the indicated block.
+struct buf*
+bread(uint dev, uint blockno)
+{
+  struct buf *b;
+
+  b = bget(dev, blockno);
+  if(!b->valid) {
+    virtio_disk_rw(b, 0);
+    b->valid = 1;
+  }
+  return b;
+}
+
+// Write b's contents to disk.  Must be locked.
+void
+bwrite(struct buf *b)
+{
+  if(!holdingsleep(&b->lock))
+    panic("bwrite");
+  virtio_disk_rw(b, 1);
+}
+
+// Release a locked buffer.
+// Move to the head of the most-recently-used list.
 void
 brelse(struct buf *b)
 {
@@ -192,5 +219,4 @@ bunpin(struct buf* b) {
   b->refcnt--;
   release(&bcache.bufmap_locks[key]);
 }
-
 
